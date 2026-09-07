@@ -23,12 +23,15 @@
 //! delegating to `lopdf`, since any future expanding filter added there would
 //! otherwise silently bypass the cap.
 //!
-//! [`get_page_content_capped`] additionally bounds the *aggregate* size
-//! across all of a page's content streams — many streams individually just
-//! under the per-stream cap could otherwise still add up to an unbounded
-//! total.
+//! The primary page-content path (`extractor::content_stream`) no longer
+//! goes through this module's own aggregation — it now uses lopdf 0.44's
+//! native `Document::get_page_content_with_limit` (see #478), which bounds
+//! the combined size across a page's `/Contents` streams itself. This
+//! module's per-stream decoders remain the bounded path for every other
+//! stream read in the crate: Form XObjects, ToUnicode/CMap streams, and
+//! embedded font data, none of which go through lopdf's page-content API.
 
-use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
+use lopdf::{Dictionary, Object, Stream};
 
 /// Hard cap on the decompressed size of a single stream. Set well above
 /// anything a legitimate content stream, CMap, or embedded font in this
@@ -36,13 +39,6 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 /// case bounded to a fixed, small amount of RAM regardless of how the
 /// on-disk PDF is sized.
 pub(crate) const MAX_DECOMPRESSED_STREAM_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
-
-/// Hard cap on the combined decompressed size of a single page's content
-/// streams. A page can have multiple `/Contents` streams (concatenated by
-/// `get_page_content_capped`), so bounding each individually isn't enough —
-/// enough streams just under [`MAX_DECOMPRESSED_STREAM_BYTES`] could still
-/// add up to an unbounded total.
-const MAX_PAGE_CONTENT_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 
 /// Distinguishes "this stream genuinely failed to decode" (safe to fall back
 /// to its raw bytes, matching `lopdf`'s own behavior) from "this stream
@@ -113,99 +109,6 @@ pub(crate) fn decompressed_or_raw(stream: &Stream) -> Vec<u8> {
         }
         Err(DecompressError::ExceedsCap) => Vec::new(),
     }
-}
-
-/// Bounded equivalent of `lopdf::Document::get_page_content`: concatenates a
-/// page's content streams, decompressing each through
-/// [`decompressed_content_capped`] instead of `lopdf`'s unbounded decoder.
-/// This is the main extraction entry point (`extractor::content_stream`), so
-/// it's the primary path a decompression bomb would otherwise take.
-///
-/// A stream (or the aggregate of a page's content streams) exceeding the
-/// cap fails closed with [`crate::PdfError::ResourceLimit`] rather than
-/// silently skipping/truncating the offending content — a caller must not
-/// mistake a page that hit the decompression-bomb guard for one that
-/// genuinely, successfully extracted as empty or partial. Streams that
-/// genuinely fail to decode (as opposed to exceeding the cap) still fall
-/// back to their raw bytes, matching `lopdf`'s own recovery behavior for
-/// already-uncompressed-but-mislabeled streams. The aggregate result is
-/// capped at [`MAX_PAGE_CONTENT_BYTES`] regardless of how many streams
-/// contribute to it.
-pub(crate) fn get_page_content_capped(
-    doc: &Document,
-    page_id: ObjectId,
-    page_num: u32,
-) -> Result<Vec<u8>, crate::PdfError> {
-    let mut content = Vec::new();
-    for object_id in doc.get_page_contents(page_id) {
-        if let Ok(Object::Stream(stream)) = doc.get_object(object_id) {
-            // Check the remaining budget before decompressing, not after —
-            // otherwise an already-exhausted page still pays the cost of
-            // fully decompressing (allocating up to the 64 MiB per-stream
-            // cap for) a stream whose result would just get discarded.
-            let remaining = MAX_PAGE_CONTENT_BYTES.saturating_sub(content.len());
-            if remaining == 0 {
-                return Err(crate::PdfError::ResourceLimit {
-                    page: page_num,
-                    object_id,
-                    resource: "page content (aggregate)".to_string(),
-                    limit_bytes: MAX_PAGE_CONTENT_BYTES,
-                });
-            }
-            let data: std::borrow::Cow<[u8]> = match decompressed_content_capped(stream) {
-                Ok(data) => data.into(),
-                Err(DecompressError::ExceedsCap) => {
-                    return Err(crate::PdfError::ResourceLimit {
-                        page: page_num,
-                        object_id,
-                        resource: "content stream".to_string(),
-                        limit_bytes: MAX_DECOMPRESSED_STREAM_BYTES,
-                    });
-                }
-                Err(DecompressError::Failed(msg)) => {
-                    log::debug!(
-                        "content stream {object_id:?} decode failed ({msg}), using raw bytes"
-                    );
-                    stream.content.as_slice().into()
-                }
-            };
-            // Append only up to the remaining page budget instead of
-            // extending in full and truncating afterward — extending first
-            // lets a single near-cap-sized stream push the allocation up
-            // to MAX_DECOMPRESSED_STREAM_BYTES past the intended cap, and
-            // Vec::truncate doesn't release that over-allocated capacity.
-            let take = data.len().min(remaining);
-            if take < data.len() {
-                return Err(crate::PdfError::ResourceLimit {
-                    page: page_num,
-                    object_id,
-                    resource: "page content (aggregate)".to_string(),
-                    limit_bytes: MAX_PAGE_CONTENT_BYTES,
-                });
-            }
-            // Whether there's still room for the join separator after this
-            // stream's data is appended in full.
-            let fits_with_separator = content.len() + take < MAX_PAGE_CONTENT_BYTES;
-            // Reserve exactly what this iteration needs (data plus, when
-            // applicable, the separator byte below) in one call — reserving
-            // per-push instead would leave `push`'s own amortized-doubling
-            // growth policy free to double the whole allocation just to fit
-            // one more byte, which is what actually caused the retained
-            // capacity to balloon past the cap here.
-            content.reserve_exact(take + usize::from(fits_with_separator));
-            content.extend_from_slice(&data[..take]);
-            // Mirror lopdf::Document::get_page_content, which joins
-            // multiple /Contents streams with a newline — content streams
-            // can end/begin mid-token, and concatenating them bare can
-            // merge adjacent operators into one invalid token. Only when
-            // the stream fit in full and there's still budget left, so
-            // this separator itself never pushes past the aggregate cap.
-            if fits_with_separator {
-                content.push(b'\n');
-            }
-        }
-    }
-    Ok(content)
 }
 
 /// PNG/TIFF predictor post-processing, mirroring `lopdf`'s private
@@ -603,131 +506,5 @@ mod tests {
             decompressed_content_capped(&stream),
             Err(DecompressError::Failed(_))
         ));
-    }
-
-    #[test]
-    fn get_page_content_capped_fails_closed_on_exhausted_aggregate_cap() {
-        // Five streams, each individually well under
-        // MAX_DECOMPRESSED_STREAM_BYTES (64 MiB) so none is rejected on its
-        // own, but summing to well past MAX_PAGE_CONTENT_BYTES (256 MiB).
-        // Silently truncating and returning partial content would let a
-        // caller mistake incomplete extraction for a successful one — must
-        // fail closed with a typed ResourceLimit error instead.
-        use lopdf::dictionary;
-        const STREAM_RAW_BYTES: usize = 55 * 1024 * 1024;
-        let mut doc = Document::with_version("1.4");
-        let pages_id = doc.new_object_id();
-        let page_id = doc.new_object_id();
-
-        let content_ids: Vec<Object> = (0..5)
-            .map(|_| {
-                let raw = vec![0u8; STREAM_RAW_BYTES];
-                Object::Reference(doc.add_object(Object::Stream(flate_stream(&raw))))
-            })
-            .collect();
-
-        doc.objects.insert(
-            page_id,
-            Object::Dictionary(dictionary! {
-                "Type" => "Page",
-                "Parent" => Object::Reference(pages_id),
-                "Contents" => Object::Array(content_ids),
-            }),
-        );
-        doc.objects.insert(
-            pages_id,
-            Object::Dictionary(dictionary! {
-                "Type" => "Pages",
-                "Kids" => vec![Object::Reference(page_id)],
-                "Count" => Object::Integer(1),
-            }),
-        );
-
-        let result = get_page_content_capped(&doc, page_id, 1);
-        match result {
-            Err(crate::PdfError::ResourceLimit {
-                page, limit_bytes, ..
-            }) => {
-                assert_eq!(page, 1);
-                assert_eq!(limit_bytes, MAX_PAGE_CONTENT_BYTES);
-            }
-            other => panic!("expected ResourceLimit error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn get_page_content_capped_fails_closed_on_oversized_single_stream() {
-        // A single stream exceeding MAX_DECOMPRESSED_STREAM_BYTES must
-        // fail closed with ResourceLimit, not silently skip and return
-        // whatever other content happened to be present.
-        use lopdf::dictionary;
-        let mut doc = Document::with_version("1.4");
-        let pages_id = doc.new_object_id();
-        let page_id = doc.new_object_id();
-
-        let raw = vec![0u8; MAX_DECOMPRESSED_STREAM_BYTES + 1];
-        let content_id = doc.add_object(Object::Stream(flate_stream(&raw)));
-
-        doc.objects.insert(
-            page_id,
-            Object::Dictionary(dictionary! {
-                "Type" => "Page",
-                "Parent" => Object::Reference(pages_id),
-                "Contents" => Object::Reference(content_id),
-            }),
-        );
-        doc.objects.insert(
-            pages_id,
-            Object::Dictionary(dictionary! {
-                "Type" => "Pages",
-                "Kids" => vec![Object::Reference(page_id)],
-                "Count" => Object::Integer(1),
-            }),
-        );
-
-        let result = get_page_content_capped(&doc, page_id, 3);
-        match result {
-            Err(crate::PdfError::ResourceLimit {
-                page, limit_bytes, ..
-            }) => {
-                assert_eq!(page, 3);
-                assert_eq!(limit_bytes, MAX_DECOMPRESSED_STREAM_BYTES);
-            }
-            other => panic!("expected ResourceLimit error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn get_page_content_capped_succeeds_under_the_cap() {
-        let raw = b"0 0 0 rg 0 0 1 1 re f".to_vec();
-        let mut doc = Document::with_version("1.4");
-        let pages_id = doc.new_object_id();
-        let page_id = doc.new_object_id();
-        let content_id = doc.add_object(Object::Stream(flate_stream(&raw)));
-        use lopdf::dictionary;
-        doc.objects.insert(
-            page_id,
-            Object::Dictionary(dictionary! {
-                "Type" => "Page",
-                "Parent" => Object::Reference(pages_id),
-                "Contents" => Object::Reference(content_id),
-            }),
-        );
-        doc.objects.insert(
-            pages_id,
-            Object::Dictionary(dictionary! {
-                "Type" => "Pages",
-                "Kids" => vec![Object::Reference(page_id)],
-                "Count" => Object::Integer(1),
-            }),
-        );
-
-        let content = get_page_content_capped(&doc, page_id, 1).expect("should succeed");
-        // A trailing join separator is appended after every stream that
-        // fits with room to spare, matching lopdf's own multi-stream join
-        // behavior.
-        let mut expected = raw;
-        expected.push(b'\n');
-        assert_eq!(content, expected);
     }
 }
